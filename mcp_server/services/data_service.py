@@ -14,6 +14,130 @@ from .parser_service import ParserService
 from ..utils.errors import DataNotFoundError
 
 
+import difflib
+import logging
+from typing import List, Dict, Any, Optional
+
+# 尝试导入高级NLP库，如果不存在则回退到基础模式
+try:
+    import jieba
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    HAS_NLP_LIBS = True
+except ImportError:
+    HAS_NLP_LIBS = False
+
+logger = logging.getLogger(__name__)
+
+class NewsDeduplicator:
+    def __init__(self, threshold: float = 0.75, use_nlp: bool = True):
+        """
+        初始化去重器
+        :param threshold: 相似度阈值 (0.0 - 1.0)，超过此值视为重复。默认 0.75
+        :param use_nlp: 是否使用 NLP (jieba + TF-IDF) 模式。如果库缺失会自动回退。
+        """
+        self.threshold = threshold
+        self.use_nlp = use_nlp and HAS_NLP_LIBS
+        self.history_buffer: List[Dict[str, str]] = []  # 存储最近的新闻用于比对
+        
+        if not HAS_NLP_LIBS and use_nlp:
+            logger.warning("Jieba or Scikit-learn not found. Falling back to difflib for deduplication.")
+
+    def _clean_text(self, text: str) -> str:
+        """简单的文本清洗"""
+        if not text:
+            return ""
+        # 移除空白字符，统一格式
+        return text.strip().replace("\n", "").replace("\r", "")
+
+    def _similarity_difflib(self, text_a: str, text_b: str) -> float:
+        """
+        使用 Python 标准库 difflib 计算相似度
+        优点: 无需依赖，速度快
+        缺点: 对长文本或语序变动敏感
+        """
+        return difflib.SequenceMatcher(None, text_a, text_b).ratio()
+
+    def _similarity_nlp(self, text_a: str, text_b: str) -> float:
+        """
+        使用 TF-IDF 和 余弦相似度 计算相似度
+        优点: 能捕捉关键词重叠，对语序不敏感，适合新闻
+        """
+        if not text_a or not text_b:
+            return 0.0
+            
+        # 1. 分词
+        words_a = " ".join(jieba.cut(text_a))
+        words_b = " ".join(jieba.cut(text_b))
+        
+        # 2. 向量化
+        corpus = [words_a, words_b]
+        try:
+            vectorizer = TfidfVectorizer()
+            tfidf_matrix = vectorizer.fit_transform(corpus)
+            
+            # 3. 计算余弦相似度
+            similarity = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+            return float(similarity)
+        except ValueError:
+            # 处理空词汇集等异常
+            return 0.0
+
+    def is_duplicate(self, new_article: Dict[str, str], check_content: bool = False) -> bool:
+        """
+        判断一条新闻是否重复
+        :param new_article: 包含 'title' 和可选 'content' 的字典
+        :param check_content: 是否比对正文内容（默认只比对标题，速度更快）
+        :return: True 表示重复，False 表示新新闻
+        """
+        new_text = self._clean_text(new_article.get("title", ""))
+        if check_content and new_article.get("content"):
+            new_text += " " + self._clean_text(new_article.get("content", ""))
+
+        if not new_text:
+            return False
+
+        # 与历史记录比对
+        for existing_item in self.history_buffer:
+            existing_text = self._clean_text(existing_item.get("title", ""))
+            if check_content and existing_item.get("content"):
+                existing_text += " " + self._clean_text(existing_item.get("content", ""))
+
+            score = 0.0
+            if self.use_nlp:
+                score = self._similarity_nlp(new_text, existing_text)
+            else:
+                score = self._similarity_difflib(new_text, existing_text)
+
+            if score >= self.threshold:
+                logger.info(f"Duplicate found: '{new_article.get('title')}' similar to '{existing_item.get('title')}' (Score: {score:.2f})")
+                return True
+
+        return False
+
+    def add_to_history(self, article: Dict[str, str]):
+        """将非重复新闻加入历史记录，用于后续比对"""
+        self.history_buffer.append(article)
+        # 限制缓存大小，避免内存无限增长 (例如只保留最近1000条)
+        if len(self.history_buffer) > 1000:
+            self.history_buffer.pop(0)
+
+    def filter_list(self, articles: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """
+        批量过滤新闻列表
+        """
+        unique_articles = []
+        # 先清空缓冲区，或者你可以选择保留之前的历史
+        # self.history_buffer = [] 
+        
+        for article in articles:
+            if not self.is_duplicate(article):
+                unique_articles.append(article)
+                self.add_to_history(article)
+        
+        return unique_articles
+
+
 class DataService:
     """数据访问服务类"""
 
